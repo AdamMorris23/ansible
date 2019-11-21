@@ -21,6 +21,10 @@ DOCUMENTATION = r'''
             description: marks this as an instance of the 'azure_rm' plugin
             required: true
             choices: ['azure_rm']
+        include_subscriptions:
+            description: A list of subscriptions within the tenant to search for virtual machines. '\*' will include
+                all subscriptions in the tenant.
+            default: ['*']
         include_vm_resource_groups:
             description: A list of resource group names to search for virtual machines. '\*' will include all resource
                 groups in the subscription.
@@ -226,6 +230,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         # FUTURE: use API profiles with defaults
         self._compute_api_version = '2017-03-30'
         self._network_api_version = '2015-06-15'
+        self._subscription_api_version = '2019-06-01'
 
         self._default_header_parameters = {'Content-Type': 'application/json; charset=utf-8'}
 
@@ -234,6 +239,8 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
         self.azure_auth = None
 
         self._batch_fetch = False
+
+        self.subscription_id_list = []
 
     def verify_file(self, path):
         '''
@@ -294,30 +301,35 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
             handler_args = {}
         self._request_queue.put_nowait(UrlAction(url=url, api_version=api_version, handler=handler, handler_args=handler_args))
 
-    def _enqueue_vm_list(self, rg='*'):
+    def _enqueue_vm_list(self, subscription_id, rg='*'):
         if not rg or rg == '*':
             url = '/subscriptions/{subscriptionId}/providers/Microsoft.Compute/virtualMachines'
         else:
             url = '/subscriptions/{subscriptionId}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines'
 
-        url = url.format(subscriptionId=self._clientconfig.subscription_id, rg=rg)
+        url = url.format(subscriptionId=subscription_id, rg=rg)
         self._enqueue_get(url=url, api_version=self._compute_api_version, handler=self._on_vm_page_response)
 
-    def _enqueue_vmss_list(self, rg=None):
+    def _enqueue_vmss_list(self, subscription_id, rg=None):
         if not rg or rg == '*':
             url = '/subscriptions/{subscriptionId}/providers/Microsoft.Compute/virtualMachineScaleSets'
         else:
             url = '/subscriptions/{subscriptionId}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachineScaleSets'
 
-        url = url.format(subscriptionId=self._clientconfig.subscription_id, rg=rg)
+        url = url.format(subscriptionId=subscription_id, rg=rg)
         self._enqueue_get(url=url, api_version=self._compute_api_version, handler=self._on_vmss_page_response)
 
     def _get_hosts(self):
-        for vm_rg in self.get_option('include_vm_resource_groups'):
-            self._enqueue_vm_list(vm_rg)
+        subscription_id_list = self.get_option('include_subscriptions')
+        if not subscription_id_list or subscription_id_list == '*':
+            url = '/subscriptions'
+            self._enqueue_get(url=url, api_version=self._subscription_api_version, handler=self._on_subscription_page_response)
 
-        for vmss_rg in self.get_option('include_vmss_resource_groups'):
-            self._enqueue_vmss_list(vmss_rg)
+        for subscription_id in subscription_id_list:
+            for vm_rg in self.get_option('include_vm_resource_groups'):
+                self._enqueue_vm_list(subscription_id, vm_rg)
+            for vmss_rg in self.get_option('include_vmss_resource_groups'):
+                self._enqueue_vmss_list(subscription_id, vmss_rg)
 
         if self._batch_fetch:
             self._process_queue_batch()
@@ -398,6 +410,29 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
             url = '{0}/virtualMachines'.format(vmss['id'])
             # VMSS instances look close enough to regular VMs that we can share the handler impl...
             self._enqueue_get(url=url, api_version=self._compute_api_version, handler=self._on_vm_page_response, handler_args=dict(vmss=vmss))
+
+    def _on_subscription_page_response(self, response):
+        next_link = response.get('nextlink')
+
+        if next_link:
+            self._enqueue_get(url=next_link, api_version=self._subscription_api_version, handler=self._on_subscription_page_response)
+
+        if 'value' in response:
+            for s in response['value']:
+                # FUTURE: add direct Subscription filtering by tag here (performance optimization)?
+                #   "id": "/subscriptions/2c45ebb2-f41a-45f8-8316-413c6c2cfc37",
+                #   "authorizationSource": "RoleBased",
+                #   "managedByTenants": [],
+                #   "subscriptionId": "2c45ebb2-f41a-45f8-8316-413c6c2cfc37",
+                #   "tenantId": "2e319086-9a26-46a3-865f-615bed576786",
+                #   "displayName": "PSJH - Prod",
+                #   "state": "Enabled",
+                #   "subscriptionPolicies": {
+                #       "locationPlacementId": "Public_2014-09-01",
+                #       "quotaId": "EnterpriseAgreement_2014-09-01",
+                #       "spendingLimit": "Off"
+                #   }
+                self.subscription_id_list.append(s['subscriptionId'])
 
     # use the undocumented /batch endpoint to bulk-send up to 500 requests in a single round-trip
     #
@@ -554,7 +589,8 @@ class AzureHost(object):
             ) if self._vmss else {},
             virtual_machine_size=self._vm_model['properties']['hardwareProfile']['vmSize'] if self._vm_model['properties'].get('hardwareProfile') else None,
             plan=self._vm_model['properties']['plan']['name'] if self._vm_model['properties'].get('plan') else None,
-            resource_group=parse_resource_id(self._vm_model['id']).get('resource_group').lower()
+            resource_group=parse_resource_id(self._vm_model['id']).get('resource_group').lower(),
+            subscription_id=parse_resource_id(self._vm_model['id']).get('subscription')
         )
 
         # set nic-related values from the primary NIC first
